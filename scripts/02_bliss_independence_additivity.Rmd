@@ -1,0 +1,391 @@
+---
+title: "Bliss Independence Additivity Analysis"
+author: "Ronit Mohapatra, Hanyu Zhao, Lena Smirnova"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+params:
+  input_path: "data/bliss/Quantification Table.xlsx"
+  input_sheet: "RME quantification"
+  output_dir: "data_processed"
+  results_dir: "results"
+  output_excel: "Bliss_Independence_Mixture_Effects.xlsx"
+  n_boot: 5000
+  seed: 831
+  values_are_percent: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 7,
+  fig.height = 4.5
+)
+```
+
+# Purpose
+
+This R Markdown workflow evaluates whether the observed Cd + Cr(VI) mixture effect is consistent with Bliss independence additivity. The expected Bliss effect is calculated from the single-agent Cd and Cr(VI) effects at each matched concentration:
+
+\[
+E_{Bliss} = E_{Cd} + E_{Cr} - (E_{Cd} \times E_{Cr})
+\]
+
+The Bliss excess is then calculated as:
+
+\[
+E_{excess} = E_{Mix,observed} - E_{Bliss}
+\]
+
+A non-parametric bootstrap is used to estimate a 95% confidence interval for the Bliss excess at each concentration. Mixture effects are classified as follows:
+
+- **Greater than additive / synergistic**: 95% CI entirely above 0
+- **Less than additive / antagonistic**: 95% CI entirely below 0
+- **Additive**: 95% CI overlaps 0
+
+# Required packages
+
+```{r packages}
+required_packages <- c(
+  "readxl",
+  "dplyr",
+  "tidyr",
+  "tibble",
+  "stringr",
+  "janitor",
+  "readr",
+  "writexl",
+  "ggplot2"
+)
+
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "The following required package(s) are not installed: ",
+    paste(missing_packages, collapse = ", "),
+    ". Install them before rendering this R Markdown file."
+  )
+}
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+```
+
+# User-defined paths and settings
+
+This script is written to run from the repository root, following the structure described in the README.
+
+```{r paths}
+input_path <- params$input_path
+input_sheet <- params$input_sheet
+output_dir <- params$output_dir
+results_dir <- params$results_dir
+output_excel <- file.path(results_dir, params$output_excel)
+n_boot <- params$n_boot
+seed <- params$seed
+values_are_percent <- params$values_are_percent
+
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
+
+if (!file.exists(input_path)) {
+  stop(
+    "Input file not found: ", input_path,
+    "\nUpdate params$input_path in the YAML header or render with a custom input_path parameter."
+  )
+}
+```
+
+# Read and validate input data
+
+The expected input is a wide-format Excel sheet with one concentration column and replicate columns for Cd, Cr(VI), and the Cd + Cr(VI) mixture. After column-name cleaning, treatment replicate columns should follow this pattern:
+
+```text
+cd_1, cd_2, cr_1, cr_2, mix_1, mix_2, ...
+```
+
+The concentration column should be named `dose` before or after cleaning.
+
+```{r read-data}
+raw <- readxl::read_excel(
+  path = input_path,
+  sheet = input_sheet
+) %>%
+  janitor::clean_names()
+
+if (!"dose" %in% names(raw)) {
+  stop(
+    "The input sheet must contain a concentration column named 'dose'. ",
+    "Column names after cleaning are: ", paste(names(raw), collapse = ", ")
+  )
+}
+
+if (ncol(raw) < 4) {
+  stop("The input table must include 'dose' plus replicate columns for cd, cr, and mix.")
+}
+
+raw
+```
+
+# Convert to replicate-level long format
+
+```{r tidy-data}
+long <- raw %>%
+  tidyr::pivot_longer(
+    cols = -dose,
+    names_to = c("treatment", "replicate"),
+    names_pattern = "^([A-Za-z]+)_?(\\d+)$",
+    values_to = "normalized_ld_input"
+  ) %>%
+  dplyr::mutate(
+    treatment = stringr::str_to_lower(treatment),
+    replicate = as.integer(replicate),
+    normalized_ld_ratio = dplyr::if_else(
+      values_are_percent,
+      as.numeric(normalized_ld_input) / 100,
+      as.numeric(normalized_ld_input)
+    ),
+    cytotoxicity_effect = 1 - normalized_ld_ratio
+  ) %>%
+  dplyr::select(
+    dose,
+    treatment,
+    replicate,
+    normalized_ld_input,
+    normalized_ld_ratio,
+    cytotoxicity_effect
+  ) %>%
+  dplyr::filter(!is.na(treatment), !is.na(replicate))
+
+required_treatments <- c("cd", "cr", "mix")
+observed_treatments <- sort(unique(long$treatment))
+missing_treatments <- setdiff(required_treatments, observed_treatments)
+
+if (length(missing_treatments) > 0) {
+  stop(
+    "Missing required treatment group(s): ", paste(missing_treatments, collapse = ", "),
+    ". Observed treatment groups are: ", paste(observed_treatments, collapse = ", ")
+  )
+}
+
+if (any(!is.finite(long$cytotoxicity_effect))) {
+  stop("Non-finite cytotoxicity effect values detected. Check the input table for missing or non-numeric values.")
+}
+
+long
+```
+
+# Summarize single-agent and mixture effects
+
+```{r summarize-effects}
+summary_by_dose <- long %>%
+  dplyr::group_by(dose, treatment) %>%
+  dplyr::summarise(
+    mean_effect = mean(cytotoxicity_effect, na.rm = TRUE),
+    sd_effect = sd(cytotoxicity_effect, na.rm = TRUE),
+    n = dplyr::n(),
+    .groups = "drop"
+  )
+
+summary_wide <- summary_by_dose %>%
+  dplyr::select(dose, treatment, mean_effect) %>%
+  tidyr::pivot_wider(
+    names_from = treatment,
+    values_from = mean_effect
+  )
+
+missing_effect_columns <- setdiff(required_treatments, names(summary_wide))
+if (length(missing_effect_columns) > 0) {
+  stop(
+    "Could not create all required effect columns after pivoting: ",
+    paste(missing_effect_columns, collapse = ", ")
+  )
+}
+
+bliss_summary <- summary_wide %>%
+  dplyr::mutate(
+    bliss_expected_effect = cd + cr - (cd * cr),
+    mix_observed_effect = mix,
+    mean_bliss_excess = mix_observed_effect - bliss_expected_effect
+  ) %>%
+  dplyr::arrange(dose)
+
+bliss_summary
+```
+
+# Bootstrap Bliss excess confidence intervals
+
+```{r bootstrap-function}
+bootstrap_bliss_excess <- function(data, n_boot = 5000, seed = 831) {
+  set.seed(seed)
+
+  doses <- sort(unique(data$dose))
+
+  purrr::map_dfr(doses, function(current_dose) {
+    dose_data <- data %>%
+      dplyr::filter(dose == current_dose)
+
+    cd_values <- dose_data %>%
+      dplyr::filter(treatment == "cd") %>%
+      dplyr::pull(cytotoxicity_effect)
+
+    cr_values <- dose_data %>%
+      dplyr::filter(treatment == "cr") %>%
+      dplyr::pull(cytotoxicity_effect)
+
+    mix_values <- dose_data %>%
+      dplyr::filter(treatment == "mix") %>%
+      dplyr::pull(cytotoxicity_effect)
+
+    if (length(cd_values) == 0 || length(cr_values) == 0 || length(mix_values) == 0) {
+      stop("Dose ", current_dose, " is missing cd, cr, or mix replicate values.")
+    }
+
+    boot_excess <- replicate(n_boot, {
+      cd_mean <- mean(sample(cd_values, size = length(cd_values), replace = TRUE), na.rm = TRUE)
+      cr_mean <- mean(sample(cr_values, size = length(cr_values), replace = TRUE), na.rm = TRUE)
+      mix_mean <- mean(sample(mix_values, size = length(mix_values), replace = TRUE), na.rm = TRUE)
+
+      bliss_expected <- cd_mean + cr_mean - (cd_mean * cr_mean)
+      mix_mean - bliss_expected
+    })
+
+    tibble::tibble(
+      dose = current_dose,
+      bootstrap_mean_bliss_excess = mean(boot_excess, na.rm = TRUE),
+      ci_lower = as.numeric(stats::quantile(boot_excess, probs = 0.025, na.rm = TRUE)),
+      ci_upper = as.numeric(stats::quantile(boot_excess, probs = 0.975, na.rm = TRUE)),
+      n_boot = n_boot
+    )
+  })
+}
+```
+
+```{r bootstrap-analysis}
+bliss_ci <- bootstrap_bliss_excess(
+  data = long,
+  n_boot = n_boot,
+  seed = seed
+)
+
+bliss_ci
+```
+
+# Final Bliss independence results table
+
+```{r final-table}
+raw_data <- long %>%
+  dplyr::transmute(
+    Concentration = dose,
+    Condition = treatment,
+    Replicate = replicate,
+    Normalized_LD_Input = normalized_ld_input,
+    Normalized_LD_Ratio = normalized_ld_ratio,
+    Cytotoxicity_Effect = cytotoxicity_effect
+  ) %>%
+  dplyr::arrange(Concentration, Condition, Replicate)
+
+bliss_independence_results <- bliss_summary %>%
+  dplyr::select(
+    dose,
+    cd,
+    cr,
+    bliss_expected_effect,
+    mix_observed_effect,
+    mean_bliss_excess
+  ) %>%
+  dplyr::left_join(bliss_ci, by = "dose") %>%
+  dplyr::mutate(
+    interaction_type = dplyr::case_when(
+      ci_upper < 0 ~ "less than additive (antagonistic)",
+      ci_lower > 0 ~ "greater than additive (synergistic)",
+      ci_lower <= 0 & ci_upper >= 0 ~ "additive",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  dplyr::rename(
+    Concentration = dose,
+    Cd_Effect = cd,
+    Cr_Effect = cr,
+    Bliss_Expected_Effect = bliss_expected_effect,
+    Mix_Observed_Effect = mix_observed_effect,
+    Mean_Bliss_Excess = mean_bliss_excess,
+    Bootstrap_Mean_Bliss_Excess = bootstrap_mean_bliss_excess,
+    CI_Lower = ci_lower,
+    CI_Upper = ci_upper,
+    N_Bootstrap = n_boot,
+    Interaction_Type = interaction_type
+  ) %>%
+  dplyr::arrange(Concentration)
+
+bliss_independence_results
+```
+
+# Visualization
+
+```{r plot-bliss-excess}
+bliss_plot <- ggplot2::ggplot(
+  bliss_independence_results,
+  ggplot2::aes(x = Concentration, y = Mean_Bliss_Excess)
+) +
+  ggplot2::geom_hline(yintercept = 0, linetype = "dashed") +
+  ggplot2::geom_point(size = 2.5) +
+  ggplot2::geom_errorbar(
+    ggplot2::aes(ymin = CI_Lower, ymax = CI_Upper),
+    width = 0.08
+  ) +
+  ggplot2::labs(
+    title = "Bliss Independence Analysis of Cd + Cr(VI) Mixture Effects",
+    x = "Concentration",
+    y = "Bliss excess\nObserved mixture effect - Bliss expected effect"
+  ) +
+  ggplot2::theme_classic()
+
+bliss_plot
+```
+
+# Export results
+
+```{r export-results}
+readr::write_csv(
+  raw_data,
+  file.path(output_dir, "bliss_replicate_level_data.csv")
+)
+
+readr::write_csv(
+  bliss_independence_results,
+  file.path(output_dir, "bliss_independence_results.csv")
+)
+
+ggplot2::ggsave(
+  filename = file.path(results_dir, "bliss_excess_bootstrap_ci.pdf"),
+  plot = bliss_plot,
+  width = 7,
+  height = 4.5
+)
+
+writexl::write_xlsx(
+  x = list(
+    Raw_Data = raw_data,
+    Bliss_Independence_Results = bliss_independence_results
+  ),
+  path = output_excel
+)
+
+cat("Exported files:\n")
+cat("- ", file.path(output_dir, "bliss_replicate_level_data.csv"), "\n", sep = "")
+cat("- ", file.path(output_dir, "bliss_independence_results.csv"), "\n", sep = "")
+cat("- ", file.path(results_dir, "bliss_excess_bootstrap_ci.pdf"), "\n", sep = "")
+cat("- ", output_excel, "\n", sep = "")
+```
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
